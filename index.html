@@ -1,0 +1,1264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Camera HUD v1.0 (Multi-face + Censor Bars)</title>
+<style>
+:root{
+ --pad:max(14px,env(safe-area-inset-left));
+ --top:max(14px,env(safe-area-inset-top));
+ --bottom:max(18px,env(safe-area-inset-bottom));
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:#000;overflow:hidden;font-family:ui-monospace,monospace;touch-action:manipulation}
+#v{display:none}
+#src{display:none}
+#c{display:none}
+#display{position:fixed;inset:0;width:100vw;height:100vh}
+#hud{position:fixed;inset:12px;border:1px solid rgba(255,255,255,.55);pointer-events:none}
+.info{position:absolute;color:#fff;font-size:12px;line-height:1.4;text-shadow:0 0 6px #000}
+#tl{top:var(--top);left:var(--pad)}
+#tr{top:var(--top);right:var(--pad);text-align:right}
+#bl{left:var(--pad);bottom:calc(110px + var(--bottom))}
+#br{right:var(--pad);bottom:calc(110px + var(--bottom));text-align:right}
+#msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;text-align:center;padding:0 30px;pointer-events:none}
+#msg.hidden{display:none}
+#controls{
+position:fixed;left:50%;bottom:var(--bottom);transform:translateX(-50%);
+display:flex;align-items:center;gap:8px;
+padding:10px 12px;background:rgba(0,0,0,.45);
+backdrop-filter:blur(14px);
+border:1px solid rgba(255,255,255,.18);
+border-radius:999px;
+width:min(96vw,860px);
+justify-content:center;
+flex-wrap:nowrap;
+overflow-x:auto;
+}
+button,select,input[type=range]{
+height:44px;
+border-radius:999px;
+border:1px solid #666;
+background:#111;color:#fff;
+font-family:inherit;
+font-size:12px;
+flex:0 0 auto;
+}
+button,select{padding:0 12px}
+input[type=range]{flex:1 1 70px;min-width:60px;padding:0 8px}
+#capture{width:54px;height:54px;border-radius:50%;font-weight:bold;flex:0 0 auto}
+#rec.active{background:#a00;border-color:#f55;color:#fff}
+#start.active{background:#222;border-color:#5f5;color:#5f5}
+#trail.active{background:#005;border-color:#88f;color:#fff}
+@media (max-width:700px){
+ .info{font-size:10px}
+ #controls{width:calc(100vw - 16px);gap:6px;padding:8px}
+ button,select{font-size:11px;padding:0 10px}
+ #capture{width:58px;height:58px}
+}
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted></video>
+<canvas id="src"></canvas>
+<canvas id="c"></canvas>
+<canvas id="display"></canvas>
+
+<div id="msg">TAP START TO ENABLE CAMERA</div>
+
+<div id="hud">
+<div id="tl" class="info">CAM_01<br><span id="fxLabel">POSTERIZE</span></div>
+<div id="tr" class="info"><span id="liveLabel">OFF</span></div>
+<div id="bl" class="info">REGION : <span id="regionLabel">FACE (searching...)</span></div>
+<div id="br" class="info">INTENSITY <span id="intensityLabel">60</span>%</div>
+</div>
+
+<div id="controls">
+<button id="start">START</button>
+<select id="target">
+ <option value="face" selected>Face Outline</option>
+ <option value="eyes">Eyes (bar)</option>
+ <option value="mouth">Mouth (bar)</option>
+</select>
+<select id="effect">
+ <option value="posterize" selected>Posterize</option>
+ <option value="glitch">Glitch</option>
+ <option value="warp">Domain Warp</option>
+ <option value="ascii">ASCII</option>
+ <option value="datamosh">Datamosh</option>
+ <option value="slitscan">Slit-scan</option>
+</select>
+<input id="intensity" type="range" min="0" max="100" value="60">
+<button id="capture">●</button>
+<button id="rec">REC</button>
+<button id="trail">TRAIL</button>
+</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+(async function(){
+ const video = document.getElementById('v');
+ const srcCanvas = document.getElementById('src');
+ const srcCtx = srcCanvas.getContext('2d', {willReadFrequently:false});
+ const canvas = document.getElementById('c'); // hidden -- WebGL render target
+ const gl = canvas.getContext('webgl', {preserveDrawingBuffer:true}) ||
+            canvas.getContext('experimental-webgl', {preserveDrawingBuffer:true});
+ const displayCanvas = document.getElementById('display'); // visible -- composited output (WebGL frame + bubbles)
+ const displayCtx = displayCanvas.getContext('2d');
+
+ const startBtn = document.getElementById('start');
+ const captureBtn = document.getElementById('capture');
+ const recBtn = document.getElementById('rec');
+ const trailBtn = document.getElementById('trail');
+ const targetSel = document.getElementById('target');
+ const effectSel = document.getElementById('effect');
+ const intensityInput = document.getElementById('intensity');
+ const msg = document.getElementById('msg');
+
+ const fxLabel = document.getElementById('fxLabel');
+ const liveLabel = document.getElementById('liveLabel');
+ const intensityLabel = document.getElementById('intensityLabel');
+ const regionLabel = document.getElementById('regionLabel');
+
+ const FALLBACK_BAND_FRAC = 0.30; // used only if face mesh is unavailable
+ const EFFECT_VALUES = { posterize:0.0, glitch:1.0, warp:3.0, ascii:4.0, datamosh:6.0, slitscan:7.0 };
+ const ASCII_CHAR_PX = 9; // on-screen width (px) per ASCII cell; height derived as *1.4 for a monospace-ish aspect
+ const SMOOTH = 0.35;
+ const MAX_POLY = 40;
+ const MAX_FACES = 2;
+ const MIRROR = true;
+
+ // Standard MediaPipe FaceMesh (468-point) contour index groups
+ const FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
+ const LIPS_OUTER = [61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
+ const LEFT_EYE   = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
+ const RIGHT_EYE  = [263,249,390,373,374,380,381,382,362,398,384,385,386,387,388,466];
+ const EYES_COMBINED = LEFT_EYE.concat(RIGHT_EYE);
+
+ // padding as a fraction of each bbox's own width/height, tuned so "eyes"
+ // reads as a proper censor bar rather than a tight sliver around the lids
+ const RECT_PADDING = {
+   eyes:  { x: 0.15, y: 0.9 },
+   mouth: { x: 0.25, y: 0.5 }
+ };
+
+ let stream = null;
+ let running = false;
+ let rafId = null;
+ let mediaRecorder = null;
+ let recChunks = [];
+ let recording = false;
+ let startTime = performance.now();
+
+ let faceLandmarker = null;
+ let faceTrackingReady = false;
+ let framesSinceDetection = 999;
+ let currentTarget = targetSel.value;
+
+ // smoothing state, one slot per tracked face (index 0 / 1)
+ let smoothedPoly = [null, null];
+ let smoothedRect = [null, null];
+
+ // mouth-open -> bubble particles (expression-reactive feature)
+ const BUBBLE_JAW_OPEN_THRESHOLD = 0.12; // jawOpen blendshape score that counts as "mouth open" (lowered so a slight opening triggers it)
+ const BUBBLE_SPAWN_INTERVAL = 120; // ms between bubbles while mouth stays open (denser stream)
+ let bubbles = [];
+ let lastBubbleSpawn = 0;
+ let lastFrameTime = performance.now();
+
+ if(!gl){
+   msg.textContent = 'WEBGL NOT SUPPORTED ON THIS BROWSER';
+ }
+
+ targetSel.addEventListener('change', ()=>{
+   currentTarget = targetSel.value;
+   smoothedPoly = [null, null];
+   smoothedRect = [null, null];
+ });
+
+ async function initFaceLandmarker(){
+   try{
+     const vision = await FilesetResolver.forVisionTasks(
+       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+     );
+     faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+       baseOptions:{
+         modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+         delegate: "GPU"
+       },
+       runningMode: "VIDEO",
+       numFaces: MAX_FACES,
+       outputFaceBlendshapes: true,
+       outputFacialTransformationMatrixes: false
+     });
+     faceTrackingReady = true;
+   }catch(err){
+     console.error('Face landmarker load failed, falling back to fixed band:', err);
+     faceTrackingReady = false;
+   }
+ }
+ const faceLandmarkerPromise = initFaceLandmarker();
+
+ // WebGL program/uniform handles declared here (before resizeCanvas runs)
+ // so the early `if(program)` check below doesn't hit them before
+ // initialization -- they're assigned later in initGL().
+ let program, aPosLoc, texture, uTexLoc, uIntensityLoc, uEffectLoc, uTimeLoc, uTexelLoc;
+ let uAsciiAtlasLoc, uCellSizeLoc, asciiAtlasTex, uPrevFrameLoc;
+ let uUseFallbackLoc, uModeLoc, uXMinLoc, uXMaxLoc, uYMinLoc, uYMaxLoc;
+ let uPoly1Loc, uPoly1NextLoc, uPoly1CountLoc, uPoly2Loc, uPoly2NextLoc, uPoly2CountLoc;
+ let uRect1Loc, uRect2Loc, uRect2ActiveLoc;
+ let passProgram, passUTexLoc;
+ let feedbackProgram, uCurrentLoc, uPrevLoc, uDecayLoc;
+ let slitScanProgram, uSlitHistoryUpdateLoc, uSlitCurrentLoc, uSlitTexelLoc, uSlitHistoryMainLoc, uSlitShiftSpeedLoc;
+ let fboA, fboB, fboC, fboW = 0, fboH = 0;
+ let prevFrameBuf; // always holds last frame's rendered output, for Datamosh
+ let slitA, slitB, slitReadBuf, slitWriteBuf; // slit-scan history ping-pong pair
+ let trailOn = false;
+ let trailReadBuf, trailWriteBuf; // ping-pong pair (fboB/fboC), swapped each frame
+
+ function resizeCanvas(){
+   const w = window.innerWidth, h = window.innerHeight;
+   srcCanvas.width = w; srcCanvas.height = h;
+   canvas.width = w; canvas.height = h;
+   displayCanvas.width = w; displayCanvas.height = h;
+   if(gl) gl.viewport(0, 0, w, h);
+   if(program) setupFBOs(w, h); // resize offscreen render targets too, once they exist
+ }
+ window.addEventListener('resize', resizeCanvas);
+ resizeCanvas();
+
+ function syncLabels(){
+   fxLabel.textContent = effectSel.value.toUpperCase();
+   intensityLabel.textContent = intensityInput.value;
+ }
+ effectSel.addEventListener('change', syncLabels);
+ intensityInput.addEventListener('input', syncLabels);
+ syncLabels();
+
+ async function startCamera(){
+   try{
+     const videoConstraints = { facingMode:'user', width:{ideal:1280}, height:{ideal:720} };
+     try{
+       // try camera + mic together, so REC can include audio
+       stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: true });
+     }catch(audioErr){
+       // mic denied/unavailable -- don't let that break the camera entirely,
+       // fall back to video-only (REC will just be silent in that case)
+       console.warn('Mic unavailable, falling back to video-only:', audioErr);
+       stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
+     }
+     video.srcObject = stream;
+     await video.play();
+     msg.classList.add('hidden');
+     liveLabel.textContent = 'LIVE';
+     startBtn.textContent = 'STOP';
+     startBtn.classList.add('active');
+     running = true;
+     await faceLandmarkerPromise;
+     rafId = requestAnimationFrame(drawFrame);
+   }catch(err){
+     msg.classList.remove('hidden');
+     msg.textContent = 'CAMERA ERROR: ' + (err && err.message ? err.message : err);
+   }
+ }
+
+ function stopCamera(){
+   running = false;
+   if(rafId) cancelAnimationFrame(rafId);
+   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
+   liveLabel.textContent = 'OFF';
+   startBtn.textContent = 'START';
+   startBtn.classList.remove('active');
+   msg.classList.remove('hidden');
+   msg.textContent = 'TAP START TO ENABLE CAMERA';
+   smoothedPoly = [null, null];
+   smoothedRect = [null, null];
+   framesSinceDetection = 999;
+ }
+
+ startBtn.addEventListener('click', ()=>{
+   if(!gl) return;
+   if(running) stopCamera(); else startCamera();
+ });
+
+ function clearFBO(target){
+   gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+   gl.viewport(0, 0, fboW, fboH);
+   gl.clearColor(0, 0, 0, 0);
+   gl.clear(gl.COLOR_BUFFER_BIT);
+   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+ }
+
+ trailBtn.addEventListener('click', ()=>{
+   trailOn = !trailOn;
+   trailBtn.classList.toggle('active', trailOn);
+   if(trailOn && fboB && fboC){
+     // start each trail session from a clean (empty) accumulator, not
+     // whatever old ghost was left over from a previous toggle
+     clearFBO(fboB);
+     clearFBO(fboC);
+     trailReadBuf = fboB;
+     trailWriteBuf = fboC;
+   }
+ });
+
+ function drawCover(destCtx, w, h){
+   const vw = video.videoWidth, vh = video.videoHeight;
+   if(!vw || !vh) return false;
+   const scale = Math.max(w/vw, h/vh);
+   const sw = w/scale, sh = h/scale;
+   const sx = (vw-sw)/2, sy = (vh-sh)/2;
+   destCtx.save();
+   if(MIRROR){
+     destCtx.translate(w, 0);
+     destCtx.scale(-1, 1);
+   }
+   destCtx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+   destCtx.restore();
+   return true;
+ }
+
+ function mapPointToUV(nx, ny, vw, vh, canvasW, canvasH){
+   const scale = Math.max(canvasW/vw, canvasH/vh);
+   const sw = canvasW/scale, sh = canvasH/scale;
+   const sx = (vw-sw)/2, sy = (vh-sh)/2;
+   const px = nx*vw, py = ny*vh;
+   let cx = (px - sx) * scale;
+   const cy = (py - sy) * scale;
+   if(MIRROR) cx = canvasW - cx;
+   return { x: Math.min(1, Math.max(0, cx/canvasW)), y: 1 - Math.min(1, Math.max(0, cy/canvasH)) };
+ }
+
+ function lerp(a,b,t){ return a + (b-a)*t; }
+
+ // -- mouth-open bubble particles (rendered on the 2D display canvas, on
+ // top of the composited WebGL frame) --
+ function spawnBubble(x, y){
+   const r = 8 + Math.random()*14;
+   bubbles.push({
+     x, y,
+     vx: (Math.random()-0.5) * 24,       // px/sec, slight side drift
+     vy: -(40 + Math.random()*35),       // px/sec, rises upward
+     r, baseR: r,                        // px radius (baseR used for the "breathing" size wobble)
+     born: performance.now(),
+     life: 2500 + Math.random()*1500,    // ms
+     wobblePhase: Math.random()*Math.PI*2,
+     wobbleFreq: 1.2 + Math.random()*1.3,
+     breathPhase: Math.random()*Math.PI*2,
+     breathFreq: 1.5 + Math.random()*1.5,
+     hueShift: Math.random()*360
+   });
+ }
+
+ function updateAndDrawBubbles(dt, now){
+   const t = now/1000;
+   for(let i=bubbles.length-1; i>=0; i--){
+     const b = bubbles[i];
+     const age = now - b.born;
+     if(age > b.life || b.y < -50){ bubbles.splice(i,1); continue; }
+     b.x += b.vx * dt;
+     b.y += b.vy * dt;
+
+     // gentle side-to-side sway + size "breathing", layered on top of the
+     // straight rise/drift motion, for a more alive/floaty feel
+     const drawX = b.x + Math.sin(t*b.wobbleFreq + b.wobblePhase) * 4;
+     const drawY = b.y;
+     const r = b.baseR * (1 + 0.12*Math.sin(t*b.breathFreq + b.breathPhase));
+
+     const lifeFrac = age / b.life;
+     const alpha = lifeFrac < 0.8 ? 1.0 : (1.0 - (lifeFrac-0.8)/0.2); // fade out in the last 20% of life
+
+     displayCtx.save();
+     displayCtx.globalAlpha = Math.max(0, alpha);
+
+     // base glassy fill (soft, layered radial gradient)
+     const grad = displayCtx.createRadialGradient(drawX-r*0.35, drawY-r*0.35, r*0.05, drawX, drawY, r);
+     grad.addColorStop(0, 'rgba(255,255,255,0.55)');
+     grad.addColorStop(0.35, 'rgba(210,235,255,0.28)');
+     grad.addColorStop(0.75, 'rgba(170,210,255,0.12)');
+     grad.addColorStop(1, 'rgba(150,200,255,0.04)');
+     displayCtx.beginPath();
+     displayCtx.arc(drawX, drawY, r, 0, Math.PI*2);
+     displayCtx.fillStyle = grad;
+     displayCtx.fill();
+
+     // iridescent rim -- two soft tinted strokes with a slow hue drift,
+     // approximating the rainbow sheen on a real soap bubble's surface
+     displayCtx.lineWidth = Math.max(1, r*0.06);
+     displayCtx.strokeStyle = `hsla(${(b.hueShift + t*40) % 360}, 90%, 80%, 0.35)`;
+     displayCtx.beginPath();
+     displayCtx.arc(drawX, drawY, r*0.98, 0, Math.PI*2);
+     displayCtx.stroke();
+     displayCtx.strokeStyle = `hsla(${(b.hueShift + 140 + t*40) % 360}, 90%, 80%, 0.25)`;
+     displayCtx.beginPath();
+     displayCtx.arc(drawX, drawY, r*0.9, 0, Math.PI*2);
+     displayCtx.stroke();
+
+     // sharp specular highlight -- the small bright "shine" dot that sells
+     // the glassy/3D look
+     displayCtx.beginPath();
+     displayCtx.arc(drawX - r*0.35, drawY - r*0.35, Math.max(1, r*0.18), 0, Math.PI*2);
+     displayCtx.fillStyle = 'rgba(255,255,255,0.85)';
+     displayCtx.fill();
+
+     displayCtx.restore();
+   }
+ }
+
+ function smoothPolyPts(prevArr, targetArr){
+   if(!prevArr || prevArr.length !== targetArr.length) return targetArr;
+   return targetArr.map((p, i)=>({
+     x: lerp(prevArr[i].x, p.x, SMOOTH),
+     y: lerp(prevArr[i].y, p.y, SMOOTH)
+   }));
+ }
+
+ function bboxFromPoints(points){
+   let xMin=1, xMax=0, yMin=1, yMax=0;
+   for(const p of points){
+     if(p.x<xMin) xMin=p.x;
+     if(p.x>xMax) xMax=p.x;
+     if(p.y<yMin) yMin=p.y;
+     if(p.y>yMax) yMax=p.y;
+   }
+   return {xMin,xMax,yMin,yMax};
+ }
+
+ function padBBox(bb, padXFrac, padYFrac){
+   const w = bb.xMax-bb.xMin, h = bb.yMax-bb.yMin;
+   return {
+     xMin: Math.max(0, bb.xMin - w*padXFrac),
+     xMax: Math.min(1, bb.xMax + w*padXFrac),
+     yMin: Math.max(0, bb.yMin - h*padYFrac),
+     yMax: Math.min(1, bb.yMax + h*padYFrac)
+   };
+ }
+
+ function smoothRect(prev, target){
+   if(!prev) return target;
+   return {
+     xMin: lerp(prev.xMin, target.xMin, SMOOTH),
+     xMax: lerp(prev.xMax, target.xMax, SMOOTH),
+     yMin: lerp(prev.yMin, target.yMin, SMOOTH),
+     yMax: lerp(prev.yMax, target.yMax, SMOOTH)
+   };
+ }
+
+ function packPoly(points){
+   const flat = new Float32Array(MAX_POLY*2);
+   for(let i=0;i<points.length && i<MAX_POLY;i++){
+     flat[i*2] = points[i].x;
+     flat[i*2+1] = points[i].y;
+   }
+   return flat;
+ }
+
+ function packPolyNext(points){
+   const flat = new Float32Array(MAX_POLY*2);
+   const n = points.length;
+   for(let i=0;i<n && i<MAX_POLY;i++){
+     const nxt = points[(i+1)%n];
+     flat[i*2] = nxt.x;
+     flat[i*2+1] = nxt.y;
+   }
+   return flat;
+ }
+
+ // =========================================================================
+ // WebGL setup
+ // =========================================================================
+
+
+ const VERT_SRC = `
+   attribute vec2 aPos;
+   varying vec2 vUV;
+   void main(){
+     vUV = aPos * 0.5 + 0.5;
+     gl_Position = vec4(aPos, 0.0, 1.0);
+   }
+ `;
+
+ const FRAG_SRC = `
+   precision mediump float;
+   varying vec2 vUV;
+   uniform sampler2D uTex;
+   uniform float uIntensity;
+   uniform float uEffect; // 0 = posterize, 1 = glitch, 2 = ova (cel-shade)
+   uniform float uTime;
+   uniform vec2 uTexel; // 1/width, 1/height -- for neighbor sampling (OVA smoothing/edges)
+   uniform sampler2D uAsciiAtlas;
+   uniform vec2 uCellSize; // ASCII character cell size, in UV units
+   uniform sampler2D uPrevFrame; // previous frame's rendered output, for Datamosh
+   uniform sampler2D uSlitHistory; // scrolling time-history buffer, for Slit-scan
+
+   uniform float uUseFallback;
+   uniform float uMode; // 0 = polygon (face outline, up to 2 faces), 1 = rect bar (eyes/mouth, up to 2 faces)
+   uniform float uXMin, uXMax, uYMin, uYMax; // fallback fixed band
+
+   const int MAX_POLY = ${MAX_POLY};
+   uniform vec2 uPoly1[MAX_POLY];
+   uniform vec2 uPoly1Next[MAX_POLY];
+   uniform int uPoly1Count;
+   uniform vec2 uPoly2[MAX_POLY];
+   uniform vec2 uPoly2Next[MAX_POLY];
+   uniform int uPoly2Count;
+
+   uniform vec4 uRect1; // xMin,xMax,yMin,yMax
+   uniform vec4 uRect2;
+   uniform float uRect2Active;
+
+   float hash(float n){ return fract(sin(n) * 43758.5453123); }
+
+   vec3 posterizeFx(vec3 color, float intensity){
+     float levels = mix(16.0, 2.0, intensity);
+     return floor(color * levels) / levels;
+   }
+
+   vec3 glitchFx(vec2 uv, float intensity, float time){
+     float blockY = floor(uv.y * 80.0);
+     float n = hash(blockY + floor(time * 8.0));
+     float shift = (n - 0.5) * intensity * 0.35;
+     float chAb = intensity * 0.02;
+     float r = texture2D(uTex, vec2(uv.x + shift + chAb, uv.y)).r;
+     float g = texture2D(uTex, vec2(uv.x + shift, uv.y)).g;
+     float b = texture2D(uTex, vec2(uv.x + shift - chAb, uv.y)).b;
+     return vec3(r, g, b);
+   }
+
+   // -- OVA / cel-shade -------------------------------------------------
+   // Fully unrolled (no loops/arrays) neighbor sampling: this GPU's driver
+   // is strict about dynamic array indexing (hit this earlier with the
+   // face-mesh polygon test), so small fixed neighborhoods are just
+   // written out by hand instead of looped.
+
+   vec3 ovaSmooth(vec2 uv, vec2 texel){
+     vec3 c  = texture2D(uTex, uv).rgb;
+     vec3 n0 = texture2D(uTex, uv + vec2(-1.0,-1.0)*texel*4.0).rgb;
+     vec3 n1 = texture2D(uTex, uv + vec2( 0.0,-1.0)*texel*4.0).rgb;
+     vec3 n2 = texture2D(uTex, uv + vec2( 1.0,-1.0)*texel*4.0).rgb;
+     vec3 n3 = texture2D(uTex, uv + vec2(-1.0, 0.0)*texel*4.0).rgb;
+     vec3 n4 = texture2D(uTex, uv + vec2( 1.0, 0.0)*texel*4.0).rgb;
+     vec3 n5 = texture2D(uTex, uv + vec2(-1.0, 1.0)*texel*4.0).rgb;
+     vec3 n6 = texture2D(uTex, uv + vec2( 0.0, 1.0)*texel*4.0).rgb;
+     vec3 n7 = texture2D(uTex, uv + vec2( 1.0, 1.0)*texel*4.0).rgb;
+
+     float w0 = exp(-dot(n0-c,n0-c)*12.0);
+     float w1 = exp(-dot(n1-c,n1-c)*12.0);
+     float w2 = exp(-dot(n2-c,n2-c)*12.0);
+     float w3 = exp(-dot(n3-c,n3-c)*12.0);
+     float w4 = exp(-dot(n4-c,n4-c)*12.0);
+     float w5 = exp(-dot(n5-c,n5-c)*12.0);
+     float w6 = exp(-dot(n6-c,n6-c)*12.0);
+     float w7 = exp(-dot(n7-c,n7-c)*12.0);
+
+     vec3 sum = c + n0*w0+n1*w1+n2*w2+n3*w3+n4*w4+n5*w5+n6*w6+n7*w7;
+     float wsum = 1.0+w0+w1+w2+w3+w4+w5+w6+w7;
+     return sum / wsum;
+   }
+
+   float lum(vec3 c){ return dot(c, vec3(0.299,0.587,0.114)); }
+
+   float ovaEdge(vec2 uv, vec2 texel){
+     float tl = lum(texture2D(uTex, uv+vec2(-1.0,-1.0)*texel*3.0).rgb);
+     float t  = lum(texture2D(uTex, uv+vec2( 0.0,-1.0)*texel*3.0).rgb);
+     float tr = lum(texture2D(uTex, uv+vec2( 1.0,-1.0)*texel*3.0).rgb);
+     float l  = lum(texture2D(uTex, uv+vec2(-1.0, 0.0)*texel*3.0).rgb);
+     float r  = lum(texture2D(uTex, uv+vec2( 1.0, 0.0)*texel*3.0).rgb);
+     float bl = lum(texture2D(uTex, uv+vec2(-1.0, 1.0)*texel*3.0).rgb);
+     float b  = lum(texture2D(uTex, uv+vec2( 0.0, 1.0)*texel*3.0).rgb);
+     float br = lum(texture2D(uTex, uv+vec2( 1.0, 1.0)*texel*3.0).rgb);
+     float gx = -tl - 2.0*l - bl + tr + 2.0*r + br;
+     float gy = -tl - 2.0*t - tr + bl + 2.0*b + br;
+     return sqrt(gx*gx + gy*gy);
+   }
+
+   // standard RGB<->HSV conversion, used so OVA quantization only steps
+   // brightness (value), keeping hue/saturation intact -- this is the fix
+   // for the "psychedelic" per-channel banding from quantizing R/G/B separately
+   vec3 rgb2hsv(vec3 c){
+     vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+     vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+     vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+     float d = q.x - min(q.w, q.y);
+     float e = 1.0e-10;
+     return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+   }
+   vec3 hsv2rgb(vec3 c){
+     vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+     vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+     return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+   }
+
+   vec3 ovaFx(vec2 uv, float intensity, vec2 texel, float time){
+     vec3 smoothed = ovaSmooth(uv, texel);
+     float levels = mix(6.0, 3.0, intensity); // fewer levels = bolder flat cel-shading
+
+     // quantize brightness only (HSV value channel) -- keeps hue/saturation
+     // from the source, so skin stays skin-toned instead of splitting into
+     // odd RGB-channel color blocks
+     vec3 hsv = rgb2hsv(smoothed);
+     hsv.z = floor(hsv.z * levels) / levels;
+     hsv.y = clamp(hsv.y * 1.1, 0.0, 1.0); // slight saturation boost for a punchier cel-shade look
+     vec3 flatColor = hsv2rgb(hsv);
+
+     // halation/glow -- cheap bright-pass approximation reusing the same
+     // neighborhood already sampled for smoothing (not true multi-pass
+     // bloom, but avoids adding another render pass for now)
+     float brightness = lum(smoothed);
+     float bloomAmount = smoothstep(0.65, 1.0, brightness) * 0.35 * intensity;
+     vec3 glow = vec3(1.0, 0.85, 0.6) * bloomAmount;
+
+     float edge = ovaEdge(uv, texel);
+     float threshold = mix(0.4, 0.15, intensity); // higher intensity = more sensitive outline
+     float outline = smoothstep(threshold, threshold + 0.04, edge); // sharper transition = cleaner line
+
+     vec3 color = mix(flatColor + glow, vec3(0.03), outline);
+
+     // warm VHS color grade
+     color *= vec3(1.08, 1.0, 0.9);
+
+     // chroma bleed: sample raw (unsmoothed) R/B slightly offset horizontally
+     // for a subtle analog fringing look at edges
+     float bleed = intensity * 0.01;
+     float rBleed = texture2D(uTex, uv + vec2(bleed, 0.0)).r;
+     float bBleed = texture2D(uTex, uv - vec2(bleed, 0.0)).b;
+     color.r = mix(color.r, rBleed, 0.15);
+     color.b = mix(color.b, bBleed, 0.15);
+
+     // scan lines: subtle horizontal banding
+     float scan = sin(uv.y * 800.0) * 0.5 + 0.5;
+     float scanAmt = 0.06 * intensity;
+     color *= (1.0 - scanAmt) + scanAmt * scan;
+
+     // grain: per-pixel noise, refreshed over time
+     float g = hash(uv.x * 1000.0 + uv.y * 1000.0 + time * 60.0);
+     color += (g - 0.5) * 0.08 * intensity;
+
+     return clamp(color, 0.0, 1.0);
+   }
+
+   // -- Domain warp: noise-ish UV distortion for a "liquid/melting" look --
+   vec3 warpFx(vec2 uv, float intensity, float time){
+     float t = time * 2.5; // faster animation speed
+     float wx = sin(uv.y*12.0 + t*1.3)*0.015 + sin(uv.y*5.0 - t*0.7)*0.01;
+     float wy = sin(uv.x*10.0 + t*1.7)*0.015 + sin(uv.x*4.0 + t*0.9)*0.01;
+     vec2 warpedUV = uv + vec2(wx, wy) * intensity * 2.0;
+     return texture2D(uTex, warpedUV).rgb;
+   }
+
+   // -- ASCII: divide the frame into character cells, pick a glyph from a
+   // pre-baked font-atlas texture based on that cell's brightness --
+   vec3 asciiFx(vec2 uv, vec2 cellSize){
+     vec2 cellId = floor(uv / cellSize);
+     vec2 cellUV = fract(uv / cellSize);
+     vec2 cellCenter = (cellId + 0.5) * cellSize;
+     vec3 srcColor = texture2D(uTex, cellCenter).rgb;
+     float b = lum(srcColor);
+     float charIndex = floor(clamp(b, 0.0, 0.999) * 10.0);
+     float atlasU = (charIndex + cellUV.x) / 10.0;
+     float atlasV = cellUV.y;
+     float glyphAlpha = texture2D(uAsciiAtlas, vec2(atlasU, atlasV)).r;
+     vec3 dimBg = srcColor * 0.25;              // dimmed video shows through instead of pure black
+     vec3 glyphColor = clamp(srcColor * 1.3, 0.0, 1.0); // characters pop brighter/higher contrast
+     return mix(dimBg, glyphColor, glyphAlpha);
+   }
+
+   // -- Rotoscope: pure line art, white contour on black, reusing the same
+   // Sobel edge detection built for OVA but without the flat-color fill --
+   vec3 rotoscopeFx(vec2 uv, float intensity, vec2 texel){
+     float edge = ovaEdge(uv, texel);
+     float threshold = mix(0.5, 0.12, intensity); // higher intensity = catches finer lines too
+     float lineStrength = smoothstep(threshold, threshold + 0.05, edge);
+     return vec3(1.0) * lineStrength;
+   }
+
+   // -- Datamosh: where this frame differs a lot from the last (motion),
+   // pull from a block-snapped position in the *previous* frame instead of
+   // refreshing cleanly -- approximates the classic "P-frame corruption"
+   // smear look without real video-codec motion vectors --
+   vec3 datamoshFx(vec2 uv, float intensity, vec2 texel){
+     vec3 cur = texture2D(uTex, uv).rgb;
+     vec3 prevSame = texture2D(uPrevFrame, uv).rgb;
+     float diff = length(cur - prevSame);
+     float motion = smoothstep(0.015, 0.12, diff); // more sensitive to motion than before
+
+     vec2 blockSize = texel * 14.0; // chunkier blocks -- more visible corruption
+     vec2 blockUV = floor(uv / blockSize) * blockSize;
+     vec3 smeared = texture2D(uPrevFrame, blockUV).rgb;
+
+     float strength = clamp(motion * intensity * 1.4, 0.0, 1.0); // stronger overall effect
+     return mix(cur, smeared, strength);
+   }
+
+   // -- Slit-scan: each screen column holds a different moment in time,
+   // maintained by a separate scrolling-buffer pass (see uSlitHistory) --
+   vec3 slitScanFx(vec2 uv){
+     return texture2D(uSlitHistory, uv).rgb;
+   }
+
+   bool insidePoly1(vec2 p){
+     bool inside = false;
+     for(int i=0; i<MAX_POLY; i++){
+       if(i >= uPoly1Count) break;
+       vec2 pi = uPoly1[i];
+       vec2 pj = uPoly1Next[i];
+       if(((pi.y > p.y) != (pj.y > p.y)) &&
+          (p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y) + pi.x)){
+         inside = !inside;
+       }
+     }
+     return inside;
+   }
+
+   bool insidePoly2(vec2 p){
+     bool inside = false;
+     for(int i=0; i<MAX_POLY; i++){
+       if(i >= uPoly2Count) break;
+       vec2 pi = uPoly2[i];
+       vec2 pj = uPoly2Next[i];
+       if(((pi.y > p.y) != (pj.y > p.y)) &&
+          (p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y) + pi.x)){
+         inside = !inside;
+       }
+     }
+     return inside;
+   }
+
+   bool insideRect(vec2 p, vec4 r){
+     return p.x > r.x && p.x < r.y && p.y > r.z && p.y < r.w;
+   }
+
+   void main(){
+     vec4 base = texture2D(uTex, vUV);
+     bool inMask;
+     if(uUseFallback > 0.5){
+       inMask = (vUV.x > uXMin && vUV.x < uXMax && vUV.y > uYMin && vUV.y < uYMax);
+     } else if(uMode < 0.5){
+       inMask = insidePoly1(vUV) || insidePoly2(vUV);
+     } else {
+       inMask = insideRect(vUV, uRect1) || (uRect2Active > 0.5 && insideRect(vUV, uRect2));
+     }
+     if(inMask){
+       vec3 fx;
+       if(uEffect < 0.5) fx = posterizeFx(base.rgb, uIntensity);
+       else if(uEffect < 1.5) fx = glitchFx(vUV, uIntensity, uTime);
+       else if(uEffect < 3.5) fx = warpFx(vUV, uIntensity, uTime);
+       else if(uEffect < 4.5) fx = asciiFx(vUV, uCellSize);
+       else if(uEffect < 6.5) fx = datamoshFx(vUV, uIntensity, uTexel);
+       else fx = slitScanFx(vUV);
+       gl_FragColor = vec4(fx, 1.0);
+     } else {
+       gl_FragColor = base;
+     }
+   }
+ `;
+
+ // simple passthrough shader: samples a texture and outputs it unchanged.
+ // Used for pass 2 (blit FBO -> screen). Future blur/bloom passes will be
+ // variants of this same shape (sample + process + output).
+ const PASS_FRAG_SRC = `
+   precision mediump float;
+   varying vec2 vUV;
+   uniform sampler2D uTex;
+   void main(){
+     gl_FragColor = texture2D(uTex, vUV);
+   }
+ `;
+
+ // feedback/trail blend shader: combines this frame's effect render with the
+ // previous accumulated frame (faded), producing a light-trail/motion-smear
+ // look. "max" blending keeps trails bright rather than muddying to gray.
+ const FEEDBACK_FRAG_SRC = `
+   precision mediump float;
+   varying vec2 vUV;
+   uniform sampler2D uCurrent;
+   uniform sampler2D uPrev;
+   uniform float uDecay;
+   void main(){
+     vec3 cur = texture2D(uCurrent, vUV).rgb;
+     vec3 prev = texture2D(uPrev, vUV).rgb * uDecay;
+     gl_FragColor = vec4(max(cur, prev), 1.0);
+   }
+ `;
+
+ // slit-scan history buffer update: scrolls the whole buffer left by one
+ // texel each frame, and writes the current frame's center column into the
+ // freed slot on the right -- over time, column x ends up holding whatever
+ // was at the center column (W - x) frames ago.
+ const SLIT_UPDATE_FRAG_SRC = `
+   precision mediump float;
+   varying vec2 vUV;
+   uniform sampler2D uHistory;
+   uniform sampler2D uCurrent;
+   uniform vec2 uTexel;
+   uniform float uShiftSpeed; // texels shifted per frame -- higher = buffer fills (effect becomes visible) faster
+   void main(){
+     float shiftPx = uTexel.x * uShiftSpeed;
+     if(vUV.x > 1.0 - shiftPx*1.2){
+       gl_FragColor = texture2D(uCurrent, vec2(0.5, vUV.y));
+     } else {
+       gl_FragColor = texture2D(uHistory, vUV + vec2(shiftPx, 0.0));
+     }
+   }
+ `;
+
+ // ASCII font atlas: draw a brightness-ordered character ramp onto an
+ // offscreen 2D canvas (dark->light: " .:-=+*#%@"), then upload it once as
+ // a static texture. The shader picks a cell (character) by brightness and
+ // samples within it -- no per-frame cost, built once at init.
+ function buildAsciiAtlasTexture(){
+   const chars = " .:-=+*#%@";
+   const cellPx = 32;
+   const off = document.createElement('canvas');
+   off.width = cellPx * chars.length;
+   off.height = cellPx;
+   const octx = off.getContext('2d');
+   octx.fillStyle = '#000';
+   octx.fillRect(0, 0, off.width, off.height);
+   octx.fillStyle = '#fff';
+   octx.font = 'bold ' + Math.floor(cellPx*0.85) + 'px monospace';
+   octx.textAlign = 'center';
+   octx.textBaseline = 'middle';
+   for(let i=0;i<chars.length;i++){
+     octx.fillText(chars[i], i*cellPx + cellPx/2, cellPx/2 + 2);
+   }
+   const tex = gl.createTexture();
+   gl.bindTexture(gl.TEXTURE_2D, tex);
+   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, off);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+   return tex;
+ }
+
+ function compileShader(type, src){
+   const sh = gl.createShader(type);
+   gl.shaderSource(sh, src);
+   gl.compileShader(sh);
+   if(!gl.getShaderParameter(sh, gl.COMPILE_STATUS)){
+     const info = gl.getShaderInfoLog(sh);
+     gl.deleteShader(sh);
+     throw new Error('Shader compile error: ' + info);
+   }
+   return sh;
+ }
+
+ function initGL(){
+   const vs = compileShader(gl.VERTEX_SHADER, VERT_SRC);
+   const fs = compileShader(gl.FRAGMENT_SHADER, FRAG_SRC);
+   program = gl.createProgram();
+   gl.attachShader(program, vs);
+   gl.attachShader(program, fs);
+   gl.bindAttribLocation(program, 0, 'aPos'); // force location 0 so both programs share one vertex setup
+   gl.linkProgram(program);
+   if(!gl.getProgramParameter(program, gl.LINK_STATUS)){
+     throw new Error('Program link error: ' + gl.getProgramInfoLog(program));
+   }
+   gl.useProgram(program);
+
+   const buf = gl.createBuffer();
+   gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+   aPosLoc = 0;
+   gl.enableVertexAttribArray(aPosLoc);
+   gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+   texture = gl.createTexture();
+   gl.bindTexture(gl.TEXTURE_2D, texture);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+
+   uTexLoc = gl.getUniformLocation(program, 'uTex');
+   uIntensityLoc = gl.getUniformLocation(program, 'uIntensity');
+   uEffectLoc = gl.getUniformLocation(program, 'uEffect');
+   uTimeLoc = gl.getUniformLocation(program, 'uTime');
+   uTexelLoc = gl.getUniformLocation(program, 'uTexel');
+   uAsciiAtlasLoc = gl.getUniformLocation(program, 'uAsciiAtlas');
+   uCellSizeLoc = gl.getUniformLocation(program, 'uCellSize');
+   uPrevFrameLoc = gl.getUniformLocation(program, 'uPrevFrame');
+   uSlitHistoryMainLoc = gl.getUniformLocation(program, 'uSlitHistory');
+   asciiAtlasTex = buildAsciiAtlasTexture();
+   uUseFallbackLoc = gl.getUniformLocation(program, 'uUseFallback');
+   uModeLoc = gl.getUniformLocation(program, 'uMode');
+   uXMinLoc = gl.getUniformLocation(program, 'uXMin');
+   uXMaxLoc = gl.getUniformLocation(program, 'uXMax');
+   uYMinLoc = gl.getUniformLocation(program, 'uYMin');
+   uYMaxLoc = gl.getUniformLocation(program, 'uYMax');
+   uPoly1Loc = gl.getUniformLocation(program, 'uPoly1');
+   uPoly1NextLoc = gl.getUniformLocation(program, 'uPoly1Next');
+   uPoly1CountLoc = gl.getUniformLocation(program, 'uPoly1Count');
+   uPoly2Loc = gl.getUniformLocation(program, 'uPoly2');
+   uPoly2NextLoc = gl.getUniformLocation(program, 'uPoly2Next');
+   uPoly2CountLoc = gl.getUniformLocation(program, 'uPoly2Count');
+   uRect1Loc = gl.getUniformLocation(program, 'uRect1');
+   uRect2Loc = gl.getUniformLocation(program, 'uRect2');
+   uRect2ActiveLoc = gl.getUniformLocation(program, 'uRect2Active');
+
+   // passthrough program (pass 2: blit offscreen FBO to the visible canvas)
+   const pvs = compileShader(gl.VERTEX_SHADER, VERT_SRC);
+   const pfs = compileShader(gl.FRAGMENT_SHADER, PASS_FRAG_SRC);
+   passProgram = gl.createProgram();
+   gl.attachShader(passProgram, pvs);
+   gl.attachShader(passProgram, pfs);
+   gl.bindAttribLocation(passProgram, 0, 'aPos');
+   gl.linkProgram(passProgram);
+   if(!gl.getProgramParameter(passProgram, gl.LINK_STATUS)){
+     throw new Error('Passthrough program link error: ' + gl.getProgramInfoLog(passProgram));
+   }
+   passUTexLoc = gl.getUniformLocation(passProgram, 'uTex');
+
+   // feedback/trail blend program (Phase 3)
+   const fvs = compileShader(gl.VERTEX_SHADER, VERT_SRC);
+   const ffs = compileShader(gl.FRAGMENT_SHADER, FEEDBACK_FRAG_SRC);
+   feedbackProgram = gl.createProgram();
+   gl.attachShader(feedbackProgram, fvs);
+   gl.attachShader(feedbackProgram, ffs);
+   gl.bindAttribLocation(feedbackProgram, 0, 'aPos');
+   gl.linkProgram(feedbackProgram);
+   if(!gl.getProgramParameter(feedbackProgram, gl.LINK_STATUS)){
+     throw new Error('Feedback program link error: ' + gl.getProgramInfoLog(feedbackProgram));
+   }
+   uCurrentLoc = gl.getUniformLocation(feedbackProgram, 'uCurrent');
+   uPrevLoc = gl.getUniformLocation(feedbackProgram, 'uPrev');
+   uDecayLoc = gl.getUniformLocation(feedbackProgram, 'uDecay');
+
+   // slit-scan history-buffer update program
+   const svs = compileShader(gl.VERTEX_SHADER, VERT_SRC);
+   const sfs = compileShader(gl.FRAGMENT_SHADER, SLIT_UPDATE_FRAG_SRC);
+   slitScanProgram = gl.createProgram();
+   gl.attachShader(slitScanProgram, svs);
+   gl.attachShader(slitScanProgram, sfs);
+   gl.bindAttribLocation(slitScanProgram, 0, 'aPos');
+   gl.linkProgram(slitScanProgram);
+   if(!gl.getProgramParameter(slitScanProgram, gl.LINK_STATUS)){
+     throw new Error('Slit-scan program link error: ' + gl.getProgramInfoLog(slitScanProgram));
+   }
+   uSlitHistoryUpdateLoc = gl.getUniformLocation(slitScanProgram, 'uHistory');
+   uSlitCurrentLoc = gl.getUniformLocation(slitScanProgram, 'uCurrent');
+   uSlitTexelLoc = gl.getUniformLocation(slitScanProgram, 'uTexel');
+   uSlitShiftSpeedLoc = gl.getUniformLocation(slitScanProgram, 'uShiftSpeed');
+
+   setupFBOs(canvas.width, canvas.height);
+ }
+
+ function createFBO(w, h){
+   const tex = gl.createTexture();
+   gl.bindTexture(gl.TEXTURE_2D, tex);
+   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+   const fbo = gl.createFramebuffer();
+   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+   gl.clearColor(0, 0, 0, 0);
+   gl.clear(gl.COLOR_BUFFER_BIT); // start from a known-empty texture, not undefined GPU memory
+   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+   return { fbo, tex };
+ }
+
+ function setupFBOs(w, h){
+   if(w<=0 || h<=0) return;
+   if(fboA){ gl.deleteFramebuffer(fboA.fbo); gl.deleteTexture(fboA.tex); }
+   if(fboB){ gl.deleteFramebuffer(fboB.fbo); gl.deleteTexture(fboB.tex); }
+   if(fboC){ gl.deleteFramebuffer(fboC.fbo); gl.deleteTexture(fboC.tex); }
+   if(prevFrameBuf){ gl.deleteFramebuffer(prevFrameBuf.fbo); gl.deleteTexture(prevFrameBuf.tex); }
+   if(slitA){ gl.deleteFramebuffer(slitA.fbo); gl.deleteTexture(slitA.tex); }
+   if(slitB){ gl.deleteFramebuffer(slitB.fbo); gl.deleteTexture(slitB.tex); }
+   fboA = createFBO(w, h); // pass-1 effect render target
+   fboB = createFBO(w, h); // trail ping-pong pair (Phase 3)
+   fboC = createFBO(w, h);
+   prevFrameBuf = createFBO(w, h); // last frame's output, for Datamosh
+   slitA = createFBO(w, h); // slit-scan history ping-pong pair
+   slitB = createFBO(w, h);
+   trailReadBuf = fboB;
+   trailWriteBuf = fboC;
+   slitReadBuf = slitA;
+   slitWriteBuf = slitB;
+   fboW = w; fboH = h;
+ }
+
+ if(gl){
+   try{ initGL(); }
+   catch(err){
+     console.error('WebGL init error:', err);
+     msg.classList.remove('hidden');
+     msg.textContent = 'WEBGL INIT ERROR: ' + err.message;
+   }
+ }
+
+ function getTargetIndices(target){
+   if(target === 'eyes')  return EYES_COMBINED;
+   if(target === 'mouth') return LIPS_OUTER;
+   return FACE_OVAL; // 'face'
+ }
+
+ function drawFrame(){
+   if(!running) return;
+   try{
+     const w = canvas.width, h = canvas.height;
+     const ok = drawCover(srcCtx, w, h);
+     if(ok){
+       let useFallback = 1.0;
+       const mode = currentTarget === 'face' ? 0.0 : 1.0;
+
+       let poly1Flat=null, poly1NextFlat=null, poly1Count=0;
+       let poly2Flat=null, poly2NextFlat=null, poly2Count=0;
+       let rect1=null, rect2=null;
+
+       if(faceTrackingReady){
+         const result = faceLandmarker.detectForVideo(video, performance.now());
+         const faces = result.faceLandmarks || [];
+
+         if(faces.length > 0){
+           useFallback = 0.0;
+           framesSinceDetection = 0;
+           const idx = getTargetIndices(currentTarget);
+
+           for(let f=0; f<Math.min(faces.length, MAX_FACES); f++){
+             const lm = faces[f];
+             const pts = idx.map(i => mapPointToUV(lm[i].x, lm[i].y, video.videoWidth, video.videoHeight, w, h));
+
+             if(mode < 0.5){
+               // polygon mode: face outline per face
+               smoothedPoly[f] = smoothPolyPts(smoothedPoly[f], pts);
+               if(f===0){ poly1Flat = packPoly(smoothedPoly[0]); poly1NextFlat = packPolyNext(smoothedPoly[0]); poly1Count = smoothedPoly[0].length; }
+               else     { poly2Flat = packPoly(smoothedPoly[1]); poly2NextFlat = packPolyNext(smoothedPoly[1]); poly2Count = smoothedPoly[1].length; }
+             } else {
+               // rect/bar mode: bounding box (padded) per face
+               const pad = RECT_PADDING[currentTarget] || {x:0.15, y:0.4};
+               const target = padBBox(bboxFromPoints(pts), pad.x, pad.y);
+               smoothedRect[f] = smoothRect(smoothedRect[f], target);
+               if(f===0) rect1 = smoothedRect[0]; else rect2 = smoothedRect[1];
+             }
+           }
+           regionLabel.textContent = targetSel.options[targetSel.selectedIndex].text.toUpperCase() +
+             (faces.length > 1 ? ' x' + Math.min(faces.length, MAX_FACES) : '');
+
+           // mouth-open -> bubble spawn (uses face 0 regardless of the
+           // selected Target, since this is an expression trigger, not a
+           // region-effect choice)
+           const blendshapes = result.faceBlendshapes && result.faceBlendshapes[0] && result.faceBlendshapes[0].categories;
+           if(blendshapes){
+             const jaw = blendshapes.find(c => c.categoryName === 'jawOpen');
+             const now = performance.now();
+             if(jaw && jaw.score > BUBBLE_JAW_OPEN_THRESHOLD && (now - lastBubbleSpawn) > BUBBLE_SPAWN_INTERVAL){
+               const mouthUV = mapPointToUV(faces[0][13].x, faces[0][13].y, video.videoWidth, video.videoHeight, w, h);
+               spawnBubble(mouthUV.x * w, (1 - mouthUV.y) * h);
+               lastBubbleSpawn = now;
+             }
+           }
+         } else{
+           framesSinceDetection++;
+           useFallback = framesSinceDetection > 15 ? 1.0 : 0.0;
+           regionLabel.textContent = framesSinceDetection > 30 ? 'FACE (lost)' : targetSel.options[targetSel.selectedIndex].text.toUpperCase();
+         }
+       } else {
+         regionLabel.textContent = 'FIXED (no tracking)';
+       }
+
+       // upload this frame's video early -- needed by the slit-scan update
+       // pass below, which must run before Pass 1 samples its result
+       gl.activeTexture(gl.TEXTURE0);
+       gl.bindTexture(gl.TEXTURE_2D, texture);
+       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcCanvas);
+
+       if(effectSel.value === 'slitscan'){
+         gl.bindFramebuffer(gl.FRAMEBUFFER, slitWriteBuf.fbo);
+         gl.viewport(0, 0, fboW, fboH);
+         gl.useProgram(slitScanProgram);
+         gl.activeTexture(gl.TEXTURE0);
+         gl.bindTexture(gl.TEXTURE_2D, slitReadBuf.tex);
+         gl.activeTexture(gl.TEXTURE1);
+         gl.bindTexture(gl.TEXTURE_2D, texture);
+         gl.uniform1i(uSlitHistoryUpdateLoc, 0);
+         gl.uniform1i(uSlitCurrentLoc, 1);
+         gl.uniform2f(uSlitTexelLoc, 1/w, 1/h);
+         gl.uniform1f(uSlitShiftSpeedLoc, 6.0);
+         gl.drawArrays(gl.TRIANGLES, 0, 3);
+         const tmp = slitReadBuf; slitReadBuf = slitWriteBuf; slitWriteBuf = tmp;
+       }
+
+       // PASS 1: render video + effect + mask into the offscreen FBO
+       gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo);
+       gl.viewport(0, 0, fboW, fboH);
+       gl.useProgram(program);
+
+       gl.activeTexture(gl.TEXTURE0);
+       gl.bindTexture(gl.TEXTURE_2D, texture);
+       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcCanvas);
+
+       const intensity = parseInt(intensityInput.value, 10) / 100;
+       gl.uniform1i(uTexLoc, 0);
+       gl.uniform1f(uIntensityLoc, intensity);
+       gl.uniform1f(uEffectLoc, EFFECT_VALUES[effectSel.value] ?? 0.0);
+       gl.uniform1f(uTimeLoc, (performance.now() - startTime) / 1000);
+       gl.uniform2f(uTexelLoc, 1/w, 1/h);
+
+       gl.activeTexture(gl.TEXTURE1);
+       gl.bindTexture(gl.TEXTURE_2D, asciiAtlasTex);
+       gl.uniform1i(uAsciiAtlasLoc, 1);
+       gl.uniform2f(uCellSizeLoc, ASCII_CHAR_PX / w, (ASCII_CHAR_PX*1.4) / h);
+
+       gl.activeTexture(gl.TEXTURE2);
+       gl.bindTexture(gl.TEXTURE_2D, prevFrameBuf.tex);
+       gl.uniform1i(uPrevFrameLoc, 2);
+
+       gl.activeTexture(gl.TEXTURE3);
+       gl.bindTexture(gl.TEXTURE_2D, slitReadBuf.tex); // freshest data after this frame's swap
+       gl.uniform1i(uSlitHistoryMainLoc, 3);
+
+       gl.activeTexture(gl.TEXTURE0); // leave unit 0 active for the next frame's video upload
+
+       gl.uniform1f(uUseFallbackLoc, useFallback);
+       gl.uniform1f(uModeLoc, mode);
+       gl.uniform1f(uXMinLoc, 0);
+       gl.uniform1f(uXMaxLoc, 1);
+       gl.uniform1f(uYMinLoc, 0.5 - FALLBACK_BAND_FRAC/2);
+       gl.uniform1f(uYMaxLoc, 0.5 + FALLBACK_BAND_FRAC/2);
+
+       if(poly1Flat){ gl.uniform2fv(uPoly1Loc, poly1Flat); gl.uniform2fv(uPoly1NextLoc, poly1NextFlat); gl.uniform1i(uPoly1CountLoc, poly1Count); }
+       else gl.uniform1i(uPoly1CountLoc, 0);
+       if(poly2Flat){ gl.uniform2fv(uPoly2Loc, poly2Flat); gl.uniform2fv(uPoly2NextLoc, poly2NextFlat); gl.uniform1i(uPoly2CountLoc, poly2Count); }
+       else gl.uniform1i(uPoly2CountLoc, 0);
+
+       gl.uniform4f(uRect1Loc, rect1?rect1.xMin:0, rect1?rect1.xMax:0, rect1?rect1.yMin:0, rect1?rect1.yMax:0);
+       gl.uniform4f(uRect2Loc, rect2?rect2.xMin:0, rect2?rect2.xMax:0, rect2?rect2.yMin:0, rect2?rect2.yMax:0);
+       gl.uniform1f(uRect2ActiveLoc, rect2 ? 1.0 : 0.0);
+
+       gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+       // copy this frame's result into prevFrameBuf for Datamosh to read
+       // next frame (independent of TRAIL, always kept up to date)
+       gl.bindFramebuffer(gl.FRAMEBUFFER, prevFrameBuf.fbo);
+       gl.viewport(0, 0, fboW, fboH);
+       gl.useProgram(passProgram);
+       gl.activeTexture(gl.TEXTURE0);
+       gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
+       gl.uniform1i(passUTexLoc, 0);
+       gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+       // source texture for the final blit: fboA directly, or the trail-
+       // blended result if TRAIL is on
+       let finalTex = fboA.tex;
+
+       if(trailOn){
+         // PASS 2: blend this frame (fboA) with the previous accumulated
+         // trail (trailReadBuf), writing the result into trailWriteBuf
+         gl.bindFramebuffer(gl.FRAMEBUFFER, trailWriteBuf.fbo);
+         gl.viewport(0, 0, fboW, fboH);
+         gl.useProgram(feedbackProgram);
+         gl.activeTexture(gl.TEXTURE0);
+         gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
+         gl.activeTexture(gl.TEXTURE1);
+         gl.bindTexture(gl.TEXTURE_2D, trailReadBuf.tex);
+         gl.uniform1i(uCurrentLoc, 0);
+         gl.uniform1i(uPrevLoc, 1);
+         gl.uniform1f(uDecayLoc, 0.94); // trail fade rate -- higher = longer-lingering trails
+         gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+         finalTex = trailWriteBuf.tex;
+         // swap read/write roles for next frame
+         const tmp = trailReadBuf; trailReadBuf = trailWriteBuf; trailWriteBuf = tmp;
+       }
+
+       // PASS 3: blit the final result into the (still hidden) WebGL canvas.
+       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+       gl.viewport(0, 0, canvas.width, canvas.height);
+       gl.useProgram(passProgram);
+       gl.activeTexture(gl.TEXTURE0);
+       gl.bindTexture(gl.TEXTURE_2D, finalTex);
+       gl.uniform1i(passUTexLoc, 0);
+       gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+       // composite onto the visible display canvas, then draw bubble
+       // particles on top -- this is what's actually shown/captured/recorded
+       const now = performance.now();
+       const dt = Math.min(0.1, (now - lastFrameTime) / 1000);
+       lastFrameTime = now;
+       displayCtx.clearRect(0, 0, displayCanvas.width, displayCanvas.height);
+       displayCtx.drawImage(canvas, 0, 0);
+       updateAndDrawBubbles(dt, now);
+     }
+   }catch(err){
+     console.error('drawFrame error:', err);
+     running = false;
+     msg.classList.remove('hidden');
+     msg.textContent = 'RENDER ERROR: ' + (err && err.message ? err.message : err);
+     return;
+   }
+   rafId = requestAnimationFrame(drawFrame);
+ }
+
+ captureBtn.addEventListener('click', ()=>{
+   if(!running) return;
+   displayCanvas.toBlob((blob)=>{
+     const url = URL.createObjectURL(blob);
+     const a = document.createElement('a');
+     a.href = url;
+     a.download = 'camerahud_' + Date.now() + '.png';
+     document.body.appendChild(a);
+     a.click();
+     a.remove();
+     setTimeout(()=>URL.revokeObjectURL(url), 2000);
+   }, 'image/png');
+ });
+
+ function pickRecordingMime(){
+   const candidates = [
+     'video/webm;codecs=vp9',
+     'video/webm;codecs=vp8',
+     'video/webm',
+     'video/mp4;codecs=h264',
+     'video/mp4'
+   ];
+   for(const mime of candidates){
+     if(MediaRecorder.isTypeSupported(mime)) return mime;
+   }
+   return '';
+ }
+
+ recBtn.addEventListener('click', ()=>{
+   if(!running) return;
+   if(!recording){
+     const canvasStream = displayCanvas.captureStream(30);
+     const audioTracks = stream ? stream.getAudioTracks() : [];
+     const recordStream = new MediaStream([...canvasStream.getVideoTracks(), ...audioTracks]);
+     recChunks = [];
+     const mime = pickRecordingMime();
+     mediaRecorder = mime ? new MediaRecorder(recordStream, {mimeType:mime}) : new MediaRecorder(recordStream);
+     const outMime = mediaRecorder.mimeType || mime || 'video/webm';
+     const ext = outMime.includes('mp4') ? 'mp4' : 'webm';
+     mediaRecorder.ondataavailable = (e)=>{ if(e.data.size>0) recChunks.push(e.data); };
+     mediaRecorder.onstop = ()=>{
+       const blob = new Blob(recChunks, {type:outMime});
+       const url = URL.createObjectURL(blob);
+       const a = document.createElement('a');
+       a.href = url;
+       a.download = 'camerahud_' + Date.now() + '.' + ext;
+       document.body.appendChild(a);
+       a.click();
+       a.remove();
+       setTimeout(()=>URL.revokeObjectURL(url), 4000);
+     };
+     mediaRecorder.start();
+     recording = true;
+     recBtn.classList.add('active');
+   } else {
+     mediaRecorder.stop();
+     recording = false;
+     recBtn.classList.remove('active');
+   }
+ });
+
+})();
+</script>
+</body>
+</html>
